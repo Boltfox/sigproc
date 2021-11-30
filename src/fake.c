@@ -1,6 +1,3 @@
-#ifdef HAVE_CONFIG_H
-#include <config.h>
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -20,11 +17,9 @@
 #define M_SUN 2.0e30
 #define G 6.672e-11  
 
-
-
 char inpfile[80], outfile[80];
 
-FILE *output;
+FILE *input,*output,*losmotion;
 
 
 struct BinaryParams{
@@ -50,18 +45,18 @@ main (int argc, char *argv[])
 {
 	int i,c,j,k,s,swapout,smear,nsblk=512,ic,arraysize,evenodd,headerless;
 	float pulse,snr,min=-4.0,max=4.0;
-	char string[80];
-	double psrdm,faketime,obstime,period,pulsephase,rising,trailing,dc,*shift;
+	char string[80],timfile[80],filfile[80];
+	long long numsamp;
+	int hs, existing_data=0, samplecount=0;
+	double psrdm,faketime,obstime,period,pulsephase,pulsephase_chn,rising,trailing,dc,*shift;
 	double nexttime,timestep,tdm,p0,pdot,accn,speed_of_light=299792458.0,plst;
 	long seed;
-	float *fblock;
-	float rwalk,rwsum;
+	float *fblock, *timeseries, *iblock;
 	unsigned short *sblock;
 	unsigned char *cblock;
 
 	int usebinary;
 	struct BinaryParams binaryParams;
-
 	
 	if (argc<2) {
 		fake_help();
@@ -76,12 +71,16 @@ main (int argc, char *argv[])
 		exit(0);
 	}
 
+
+	//losmotion = fopen("acceleration", "w");
+
+
 	/* set up default variables */
 	strcpy(inpfile,"stdin");
 	strcpy(outfile,"stdout");
-	machine_id=telescope_id=0;
-	machine_id=10;
-	telescope_id=4;
+	strcpy(timfile,"");
+	strcpy(filfile,"");
+	machine_id=telescope_id=1;
 	nchans=128;
 	nbits=4;
 	tstart=50000.0;
@@ -93,17 +92,15 @@ main (int argc, char *argv[])
 	output=stdout;
 	seed=-1;
 	faketime=plst=0.0;
-	psrdm=-1.0;
-	period=-1.0;
+	psrdm=period=-1.0;
 	pdot=accn=0.0;
 	pulse=0.0;
 	snr=1.0;
 	dc=0.04;
 	evenodd=swapout=0;
 	headerless=0;
-	rwalk=0.0;
-	rwsum=0;
-	
+	pulsephase=0.0;
+
 	usebinary = 0;
 	binaryParams.orbitalPeriod = 36000; 	/* 10 hours */
 	binaryParams.eccentricity = 0.0;	/* Circular */
@@ -112,6 +109,7 @@ main (int argc, char *argv[])
 	binaryParams.startPhase = 0.0;
 	binaryParams.inclination = 90.0; 	/* edge on to LOS */
 	binaryParams.omega = 0.0;
+
 	
 	
 	/* parse the command line if specified */
@@ -124,15 +122,10 @@ main (int argc, char *argv[])
 			} else if (strings_equal(argv[i],"-period")) {
 				i++;
 				period=1.0e-3*atof(argv[i]);
-			} else if (strings_equal(argv[i],"-pdot")) {
-				i++;
-				pdot=atof(argv[i]);
-			} else if (strings_equal(argv[i],"-rednoise")) {
-				i++;
-				rwalk==atof(argv[i])*0.0005;
-			} else if (strings_equal(argv[i],"-accn")) {
-				i++;
-				accn=atof(argv[i]);
+			} else if (strings_equal(argv[i],"-tim")) {
+			        strcpy(timfile,argv[++i]);
+			} else if (strings_equal(argv[i],"-fil")) {
+			        strcpy(filfile,argv[++i]);
 			} else if (strings_equal(argv[i],"-snrpeak")) {
 				i++;
 				snr=atof(argv[i]);
@@ -200,7 +193,6 @@ main (int argc, char *argv[])
 			} else if (strings_equal(argv[i],"-bcmass")) {
 				i++;
 				binaryParams.massCompanion = atof(argv[i]);
-	
 			} else {
 				/* unknown argument passed down - stop! */
 				fake_help();
@@ -211,11 +203,34 @@ main (int argc, char *argv[])
 		}
 	}
 
+	/* read in stuff from the existing tim file */
+	if (file_exists(timfile)) {
+	  input=open_file(timfile,"rb");
+	  if (!(hs=read_header(input))) 
+	    error_message("error reading header of pre-supplied timfile");
+	  numsamp=nsamples(timfile,hs,nbits,nifs,nchans);
+	  timeseries=malloc(sizeof(float)*numsamp);
+	  fread(timeseries,sizeof(float),numsamp,input);
+	  obstime=tsamp*numsamp;
+	  existing_data=1;
+	  psrdm=refdm;
+	}
+
+	/* read in stuff from the existing fil file */
+	if (file_exists(filfile)) {
+	  input=open_file(filfile,"rb");
+	  if (!(hs=read_header(input))) 
+	    error_message("error reading header of pre-supplied filfile");
+	  numsamp=nsamples(filfile,hs,nbits,nifs,nchans);
+	  obstime=tsamp*numsamp;
+	  existing_data=2;
+	}
+
 	/* get seed from ship's clock if not set */
 	if (seed == -1) seed = startseed();
 
 	/* get random period between 1 ms and 1 s if not set */
-	if (period < 0.0) period=flat(1.0e-3,-period,&seed);
+	if (period < 0.0) period=flat(1.0e-3,1.0,&seed);
 
 	/* get random DM between 1  and 1000 pc/cc if not set */
 	if (psrdm < 0.0) psrdm=flat(1.0,1.0e3,&seed);
@@ -245,13 +260,16 @@ main (int argc, char *argv[])
 	snr/=sqrt((double) nchans);
 	if (snr > 1.0) max*=snr;
 
-	rwalk/=sqrt((double) nchans);	
-
 	/* define the data blocks */
 	arraysize=nchans*nifs*nsblk;
 	fblock=(float *) malloc(sizeof(float)*arraysize);
+	iblock=(float *) malloc(sizeof(float)*arraysize);
 	sblock=(unsigned short *) malloc(sizeof(unsigned short)*arraysize);
 	cblock=(unsigned char *) malloc(sizeof(unsigned char)*arraysize);
+
+	if (existing_data==2) {
+	  read_block(input, nbits, iblock, arraysize);
+	}
 
 
 	/* open up logfile */
@@ -293,47 +311,75 @@ main (int argc, char *argv[])
 	period=p0;
 
 	/* main loop */
-	do  {
-		if (faketime>nexttime) {
-			sprintf(string,"faketime: %.1f speriod: %.12f",nexttime,period);
-			update_log(string);
-			nexttime+=timestep;
-		}
-		for (s=0;s<nsblk;s++) {
-			faketime+=tsamp;
-			if (rwalk != 0.0){
-				if (gasdev(&seed) > 2.8)rwalk=-rwalk;
-				if (rwsum >= max/2)rwalk=-fabs(rwalk);
-				if (rwsum <= min/2)rwalk=fabs(rwalk);
-				rwsum+=rwalk;
-			}
-			for (i=0;i<nifs;i++) {
-				for (c=0;c<nchans;c++) {
-					if (evenodd) {
-						fblock[s*ic+i*nchans+c]=(float)(c%2);
-					} else {
-						if (period > 0.0) {
-							pulsephase=(faketime+shift[c])/period;
-							pulsephase=pulsephase-floor(pulsephase);
-							if ( (pulsephase>=rising) && (pulsephase<=trailing) ) {
-								pulse=snr;
-							} else {
-								pulse=0.0;
-							}
-							if (plst>pulsephase) {
-								if (pdot != 0.0) period=p0+pdot*faketime;
-								if (accn != 0.0) period=p0*(1.0+accn*faketime/speed_of_light);
-								if (usebinary)   period = binary_papp(binaryParams, p0, faketime);
-							}
-							plst=pulsephase;
-						}
-						fblock[s*ic+i*nchans+c]=gasdev(&seed)+pulse +rwsum;
-					}
-				}
-			}
-		}
-		/* write out a block */
-		switch (nbits) {
+	do
+	  {
+	    if(faketime>nexttime)
+	      {
+		sprintf(string,"faketime: %.1f speriod: %.12f",nexttime,period);
+		update_log(string);
+		nexttime+=timestep;
+	      }
+	    for(s=0;s<nsblk;s++)
+	      {
+		faketime+=tsamp;
+
+		//Obtain the observed pulsar period for given faketime
+		if(usebinary==1)
+		  period=binary_papp(binaryParams,p0,faketime-tsamp*0.5);
+		else
+		  period=p0;
+
+		//update the accumulated pulse phase for channel one
+		pulsephase+=tsamp/period;
+
+		for(i=0;i<nifs;i++) 
+		  {
+		    for(c=0;c<nchans;c++)
+		      {
+			if(evenodd)
+			  {
+			    fblock[s*ic+i*nchans+c]=(float)(c%2);		
+			  }
+			else 
+			  {
+			    //obtain the observed pulsar period for given faketime
+			    if(usebinary==1)
+			      period=binary_papp(binaryParams,p0,faketime);
+			    else
+			      period=p0;
+
+			    //obtain the new fractional phase for given channel
+			    pulsephase_chn=pulsephase+shift[c]/period;
+			    pulsephase_chn=pulsephase_chn-floor(pulsephase_chn);
+
+			    //judge if the samp is within pulse-on phase range or not
+			    //simuate profile with shape of block function
+			    if((pulsephase_chn>=rising)&&(pulsephase_chn<=trailing)) 
+			      {
+				pulse=snr;
+			      }
+			    else
+			      {
+				pulse=0.0;
+			      }		
+			    if (existing_data==1) 
+			      {
+				fblock[s*ic+i*nchans+c]=timeseries[samplecount++]+pulse;
+			      } 
+			    else if(existing_data==2) 
+			      {
+				fblock[s*ic+i*nchans+c]=iblock[s*ic+i*nchans+c]+pulse;
+			      } 
+			    else 
+			      {
+				fblock[s*ic+i*nchans+c]=gasdev(&seed)+pulse;
+			      }
+			  }
+		      }
+		  }
+	      }
+	     /* write out a block */
+	    switch (nbits) {
 			case 32:
 				if (swapout) for (i=0; i<arraysize; i++) swap_float(&fblock[i]);
 				fwrite(fblock,sizeof(float),arraysize,output);
@@ -351,32 +397,29 @@ main (int argc, char *argv[])
 				float2four(fblock,arraysize,min,max,cblock);
 				fwrite(cblock,sizeof(unsigned char),arraysize/2,output);
 				break;
-			case 2:
-				float2two(fblock,arraysize,min,max,cblock);
-				fwrite(cblock,sizeof(unsigned char),arraysize/4,output);
-				break;
-
-			case 1:
-				float2one(fblock,arraysize,min,max,cblock);
-				fwrite(cblock,sizeof(unsigned char),arraysize/8,output);
-				break;
 			default:
 				sprintf(string,"fake cannot quantize data to %d bits",nbits);
 				error_message(string);
 				break;
 		}
+		if (existing_data==2) {
+		  read_block(input, nbits, iblock, arraysize);
+		}
 	} while (faketime < obstime);
 
+	/* reatmod */
+	//fclose(losmotion);
+	
 	/* all done, update log, close all files and exit normally */
 	update_log("finished");
 	close_log();
 	fclose(output);  
 	free(fblock);free(cblock);free(sblock);
 	exit(0);
+
+
+
 }
-
-
-
 
 /* 
  *  * A function for tuning the apparent period of the pulsar if it were in a binary system
@@ -390,16 +433,18 @@ double binary_papp(struct BinaryParams params,double pRest, double time){
 	double meanAnomaly;
 	double eccentricAnomaly;
 	double trueAnomaly;
-
 	double massFunction;
 	double asini;
 	double omegaB;
 	double t0;
-
 	double velocity;
-
 	double eNext;
 	double incl;
+	//reatomod below
+	double acceleration;
+	double du;
+	long TIMCOUNT;
+	long ORBFRAC;
 
 	int i;
 
@@ -426,21 +471,47 @@ double binary_papp(struct BinaryParams params,double pRest, double time){
 
 	meanAnomaly = omegaB * (time-t0);
 
-/* 
+
+ // --- start. orignal Keith/Eatough code that needed fixing. Eatough 20/01/14.
+
+ /* 
  * Need a better start point than this!!!!
  */
 	
-	eccentricAnomaly = meanAnomaly;
-
+	/*	eccentricAnomaly = meanAnomaly;
 	
-	for(i = 0 ; i < 10 ; i++){
+	
+	for(i = 0 ; i < 100 ; i++){
 		
 		eNext = eccentricAnomaly - (eccentricAnomaly - params.eccentricity * sin(eccentricAnomaly) - meanAnomaly)
 			/
 			(1.0 - params.eccentricity*cos(eccentricAnomaly));
 		
 		if(fabs(eNext - eccentricAnomaly) < 1.0e-10) break;
-		eccentricAnomaly=eNext;
+		} */
+
+	/* reatough mod 20/01/14*/
+	//eccentricAnomaly = eNext; 
+
+// --- end. orignal Keith/Eatough code that needed fixing. Eatough 20/01/14.
+
+/* updated version based on tempo where we have replaced "phase" with 
+   meanAnomaly. R. Eatough./N. Wex 20/01/14 */
+
+	/*Compute eccentric anomaly u by iterating Kepler's equation. */
+	
+	eccentricAnomaly = meanAnomaly + params.eccentricity
+	  * sin(meanAnomaly) * (1.0 + params.eccentricity*cos(meanAnomaly));
+
+	/* must initialize to "large" value */
+	du = 1.0;
+	//du = 0.0;
+
+	while(abs(du) > 1.0e-13) {
+	  du = (meanAnomaly - (eccentricAnomaly - params.eccentricity * sin(eccentricAnomaly))) / 
+	    (1.0 - params.eccentricity * cos(eccentricAnomaly));
+
+	  eccentricAnomaly += du;
 	}
 
 
@@ -459,13 +530,28 @@ double binary_papp(struct BinaryParams params,double pRest, double time){
 		* (cos(params.omega + trueAnomaly) + params.eccentricity * cos(params.omega));	
 			
 
+	//reatmod below
+	acceleration = (-1*(omegaB*omegaB)) * (asini / pow(1 - pow(params.eccentricity,2),2)) * pow((1 + (params.eccentricity*cos(trueAnomaly))),2) * sin(params.omega + trueAnomaly);
+
+	//losmotion = fopen("fake_output.txt", "w");
+	//TIMCOUNT = (long)time;
+	//ORBFRAC = (long)(params.orbitalPeriod/1000);
+	//printf("%ld %ld\n", TIMCOUNT, ORBFRAC);
+       
+
+
+	//if (fmod(TIMCOUNT,ORBFRAC)==0) {
+	//printf("%f %f, %f, %f, %f\n", time, velocity, acceleration, eccentricAnomaly, trueAnomaly);
+	  //fprintf(losmotion, "%f %f, %f, %f, %f\n", time, velocity, acceleration, eccentricAnomaly, trueAnomaly);
+	//}
+	//fclose(losmotion);
 	
-	pApp = pRest * (1.0 + (velocity / SPEED_OF_LIGHT));
+
+	
+	pApp = pRest / (1.0 - (velocity / SPEED_OF_LIGHT));
 
 			
 	return pApp;
-
-
 
 
 
